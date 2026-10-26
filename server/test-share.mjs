@@ -5,11 +5,18 @@ import assert from 'node:assert/strict';
 
 class FakeBucket {
   m = new Map();
-  async put(k, v) { this.m.set(k, typeof v === 'string' ? v : v ?? ''); }
+  ver = new Map(); // etag = numéro de version, pour les écritures conditionnelles (onlyIf) comme R2
+  async put(k, v, o = {}) {
+    const c = o.onlyIf;
+    if (c?.etagMatches && c.etagMatches !== String(this.ver.get(k))) return null;
+    if (c?.etagDoesNotMatch === '*' && this.m.has(k)) return null;
+    this.m.set(k, typeof v === 'string' ? v : v ?? ''); this.ver.set(k, (this.ver.get(k) || 0) + 1);
+    return { key: k };
+  }
   async get(k) {
     if (!this.m.has(k)) return null;
     const v = this.m.get(k);
-    return { size: String(v).length, httpEtag: '"x"', body: String(v), json: async () => JSON.parse(v), text: async () => String(v) };
+    return { size: String(v).length, etag: String(this.ver.get(k)), httpEtag: '"x"', body: String(v), json: async () => JSON.parse(v), text: async () => String(v) };
   }
   async head(k) { return this.m.has(k) ? { size: 1 } : null; }
   async delete(ks) { [].concat(ks).forEach((k) => this.m.delete(k)); }
@@ -318,14 +325,21 @@ ok('/api/list : totaux en cache 20 s (agg/stats.json), recalcul après, ?fresh=1
   const bl = await pw(R, 'bon');
   assert.equal(bl.status, 429); assert.ok((await bl.text()).includes('Trop d'));
   assert.equal((await pw(R, 'bon', '2.2.2.2')).status, 303);
-  // 50 au total par vidéo, toutes connexions confondues
+  // au-delà de 50 essais sur la vidéo : les connexions qui ont raté sont bloquées, un nouveau destinataire passe encore
   const T = 'abcdefghsec4';
   await put(T, { title: 't', password: 'bon' });
   for (let i = 0; i < 50; i++) await pw(T, 'x', `9.9.${Math.floor(i / 5)}.${i % 5}`);
-  assert.equal((await pw(T, 'bon', '8.8.8.8')).status, 429);
+  assert.equal((await pw(T, 'bon', '9.9.0.0')).status, 429, 'connexion qui a raté bloquée');
+  assert.equal((await pw(T, 'bon', '7.7.7.7')).status, 303, 'vrai destinataire jamais bloqué par les autres');
+  // 20 essais simultanés depuis la même connexion : 10 comptés au plus, aucun ne se perd
+  const S = 'abcdefghsec5';
+  await put(S, { title: 's', password: 'bon' });
+  const rs = await Promise.all(Array.from({ length: 20 }, (_, i) => pw(S, 'z' + i, '5.5.5.5')));
+  assert.ok(rs.filter((r) => r.status === 401).length <= 10, 'jamais plus de 10 essais testés');
+  assert.ok(JSON.parse(env.BUCKET.m.get(`lk/${S}.json`)).ips['5.5.5.5'] <= 10);
   // la fenêtre de 15 min passée, on peut réessayer
   const lk = JSON.parse(env.BUCKET.m.get(`lk/${T}.json`)); lk.since -= 16 * 60000; env.BUCKET.m.set(`lk/${T}.json`, JSON.stringify(lk));
-  assert.equal((await pw(T, 'bon', '8.8.8.8')).status, 303);
+  assert.equal((await pw(T, 'bon', '9.9.0.0')).status, 303);
   await api(`/api/video/${T}`, { method: 'DELETE' });
   assert.ok(!env.BUCKET.m.has(`lk/${T}.json`), 'compteur effacé avec la vidéo');
   // statistiques : vidéo inconnue refusée, vidéo privée ou à e-mail refusée sans cookie
@@ -336,5 +350,5 @@ ok('/api/list : totaux en cache 20 s (agg/stats.json), recalcul après, ?fresh=1
   assert.equal((await call(`/e/${G}?t=play`, { method: 'POST', headers: MOZ })).status, 403);
   assert.equal(nbEv(R) + nbEv(G), 0);
 }
-ok('sécurité : /s et /c fermés sans e-mail, PBKDF2 + ancien format lu, 10 essais/connexion et 50/vidéo par 15 min, stats refusées sur vidéo inconnue ou fermée');
+ok('sécurité : /s et /c fermés sans e-mail, PBKDF2 + ancien format lu, 10 essais/connexion, 50/vidéo sans bloquer un nouveau destinataire, compteur atomique, stats refusées sur vidéo inconnue ou fermée');
 console.log(`\n${n} groupes OK`);

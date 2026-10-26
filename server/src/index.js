@@ -64,18 +64,24 @@ async function checkPassword(meta, pw) {
   const [salt, h] = parts;
   return !!h && same(h, await sha256(salt + pw));
 }
-// Essais de mot de passe ratés (2026-10-26, revue sécurité) : 10 par connexion et 50 au total par vidéo et par quart d'heure.
+// Essais de mot de passe (2026-10-26, revue sécurité) : chaque essai est compté AVANT de tester le mot de passe, par écriture
+// conditionnelle R2 (etag) : deux essais simultanés ne peuvent pas lire le même compteur. 10 essais par connexion par quart d'heure ;
+// au-delà de 50 essais sur la vidéo, seules les connexions qui ont déjà raté sont bloquées (un vrai destinataire passe toujours).
 const PW_WINDOW = 15 * 60000, PW_MAX_IP = 10, PW_MAX_ALL = 50;
-async function pwFails(env, id) {
-  const o = await env.BUCKET.get(`lk/${id}.json`);
-  const f = (o && (await o.json().catch(() => null))) || {};
-  return f.since && Date.now() - f.since < PW_WINDOW ? f : { since: Date.now(), all: 0, ips: {} };
-}
-const pwBlocked = (f, req) => f.all >= PW_MAX_ALL || (f.ips[ipDe(req) || '?'] || 0) >= PW_MAX_IP;
-async function pwFail(env, id, f, req) {
-  const ip = ipDe(req) || '?';
-  f.all += 1; f.ips[ip] = (f.ips[ip] || 0) + 1;
-  await env.BUCKET.put(`lk/${id}.json`, JSON.stringify(f), { httpMetadata: { contentType: 'application/json' } });
+async function pwAttempt(env, id, req) {
+  const ip = ipDe(req) || '?', key = `lk/${id}.json`;
+  for (let i = 0; i < 5; i++) {
+    const o = await env.BUCKET.get(key);
+    let f = (o && (await o.json().catch(() => null))) || null;
+    if (!f || !f.since || Date.now() - f.since >= PW_WINDOW) f = { since: Date.now(), all: 0, ips: {} };
+    const mine = f.ips[ip] || 0;
+    if (mine >= PW_MAX_IP || (f.all >= PW_MAX_ALL && mine > 0)) return false;
+    f.all += 1; f.ips[ip] = mine + 1;
+    const done = await env.BUCKET.put(key, JSON.stringify(f), { httpMetadata: { contentType: 'application/json' },
+      onlyIf: o ? { etagMatches: o.etag } : { etagDoesNotMatch: '*' } });
+    if (done) return true;
+  }
+  return false; // trop d'essais simultanés : refusé
 }
 async function hmac(env, msg) {
   const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(`xv:${env.COOKIE_SECRET || env.UPLOAD_TOKEN}`), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
@@ -459,10 +465,9 @@ async function watch(req, env, ctx, id, url) {
   const secure = url.protocol === 'https:' ? '; Secure' : '';
   if (meta.password && !(await unlocked(req, env, id, meta))) {
     if (req.method === 'POST') {
-      const fails = await pwFails(env, id);
-      if (pwBlocked(fails, req)) return lockedPage(id, 'Trop d\'essais. Réessaie dans 15 minutes.');
+      if (!(await pwAttempt(env, id, req))) return lockedPage(id, 'Trop d\'essais. Réessaie dans 15 minutes.');
       const pw = String((await req.formData().catch(() => new FormData())).get('pw') || '');
-      if (!(await checkPassword(meta, pw))) { await pwFail(env, id, fails, req); return lockedPage(id, true); }
+      if (!(await checkPassword(meta, pw))) return lockedPage(id, true);
       return new Response(null, { status: 303, headers: { location: `/v/${id}`, 'cache-control': 'no-store',
         'set-cookie': `${cookieName(id)}=${await sign(env, id, meta)}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax${secure}` } });
     }

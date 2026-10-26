@@ -70,10 +70,17 @@ async function checkPassword(meta, pw) {
 // - par vidéo : au-delà de 50 essais, une connexion qui a déjà raté est bloquée et une nouvelle n'a droit qu'à 1 essai ;
 //   au-delà de 500, tout est refusé jusqu'à la fin du quart d'heure (plafond dur).
 const PW_WINDOW = 15 * 60000, PW_MAX_IP = 10, PW_SOFT_ALL = 50, PW_HARD_ALL = 500;
-const ipGroup = (req) => {
-  const ip = ipDe(req) || '?';
-  return ip.includes(':') ? ip.split(':').slice(0, 4).join(':') + '::/64' : ip;
-};
+// IPv6 développée en 8 groupes avant de garder les 4 premiers (« 2001:db8::1 » et « 2001:0db8:0:0::1 » = même /64)
+function ipGroup(req) {
+  const ip = (ipDe(req) || '?').toLowerCase();
+  if (!ip.includes(':')) return ip;
+  const v4 = ip.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+  if (v4) return v4[1]; // IPv4 écrite en IPv6
+  const [head, tail = ''] = ip.split('::');
+  const h = head ? head.split(':') : [], t = ip.includes('::') && tail ? tail.split(':') : [];
+  const g = ip.includes('::') ? [...h, ...Array(Math.max(0, 8 - h.length - t.length)).fill('0'), ...t] : h;
+  return g.slice(0, 4).map((x) => (parseInt(x, 16) || 0).toString(16)).join(':') + '::/64';
+}
 async function bump(env, key, limit) { // +1 si le compteur est sous la limite ; renvoie le nouveau total, ou null si refusé
   for (let i = 0; i < 5; i++) {
     const o = await env.BUCKET.get(key);
@@ -89,8 +96,8 @@ async function bump(env, key, limit) { // +1 si le compteur est sous la limite ;
 async function pwAttempt(env, id, req) {
   const all = await bump(env, `lk/${id}.json`, PW_HARD_ALL);
   if (all === null) return false; // plafond dur atteint
-  // all === undefined : compteur global disputé, on ne bloque pas pour autant (le compteur par connexion reste exact)
-  const limit = all !== undefined && all > PW_SOFT_ALL ? 1 : PW_MAX_IP;
+  // all === undefined : compteur global disputé (rafale en cours) -> traité comme au-delà de 50 : 1 essai par connexion
+  const limit = all === undefined || all > PW_SOFT_ALL ? 1 : PW_MAX_IP;
   const mine = await bump(env, `lk/${id}/${encodeURIComponent(ipGroup(req))}.json`, limit);
   return typeof mine === 'number';
 }

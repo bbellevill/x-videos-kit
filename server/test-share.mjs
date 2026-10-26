@@ -338,6 +338,12 @@ ok('/api/list : totaux en cache 20 s (agg/stats.json), recalcul après, ?fresh=1
   await put(V, { title: 'v', password: 'bon' });
   for (let i = 0; i < 10; i++) await pw(V, 'x', `2001:db8:1:2::${i.toString(16)}`);
   assert.equal((await pw(V, 'bon', '2001:db8:1:2::ffff')).status, 429, 'même /64 bloquée');
+  const V2 = 'abcdefghsec8';
+  await put(V2, { title: 'v2', password: 'bon' });
+  for (const a of ['2001:db8::1', '2001:0db8:0:0::2', '2001:DB8:0:0:0:0:0:3', '2001:db8::4', '2001:db8:0::5', '2001:db8::6', '2001:db8::7', '2001:db8::8', '2001:db8::9', '2001:db8::a'])
+    assert.equal((await pw(V2, 'x', a)).status, 401, a);
+  assert.equal((await pw(V2, 'bon', '2001:db8:0:0:ffff::1')).status, 429, 'écritures différentes de la même /64 = un compteur');
+  assert.equal((await pw(V2, 'bon', '2001:db8:0:1::1')).status, 303, 'autre /64 = autre compteur');
   // plafond dur : 500 essais sur la vidéo -> tout est refusé, même une nouvelle connexion
   const H = 'abcdefghsec7';
   await put(H, { title: 'h', password: 'bon' });

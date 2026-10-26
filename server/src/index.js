@@ -24,8 +24,8 @@ export default {
     if ((m = p.match(new RegExp(`^/r/${ID}$`)))) return guarded(req, env, m[1], () => ready(env, m[1]));
     if ((m = p.match(new RegExp(`^/t/${ID}(-play)?\\.jpg$`)))) return guarded(req, env, m[1], () => thumb(req, env, m[1], m[2] ? 'play' : 'jpg'));
     if ((m = p.match(new RegExp(`^/t/${ID}\\.gif$`)))) return guarded(req, env, m[1], () => thumb(req, env, m[1], 'gif'));
-    if ((m = p.match(new RegExp(`^/s/${ID}\\.srt$`)))) return guarded(req, env, m[1], () => srt(env, m[1]));
-    if ((m = p.match(new RegExp(`^/c/${ID}$`)))) return guarded(req, env, m[1], () => comments(req, env, m[1], url));
+    if ((m = p.match(new RegExp(`^/s/${ID}\\.srt$`)))) return guarded(req, env, m[1], () => srt(env, m[1]), true);
+    if ((m = p.match(new RegExp(`^/c/${ID}$`)))) return guarded(req, env, m[1], () => comments(req, env, m[1], url), true);
     if (p === '/') return Response.redirect(B.site, 302);
     return new Response('Vidéo introuvable', { status: 404 });
   },
@@ -42,9 +42,15 @@ const json = (data, status = 200) => new Response(JSON.stringify(data), { status
 // --- Liens privés : mot de passe salé haché (SHA-256) dans la méta, cookie signé (HMAC) pour débloquer ---
 const hex = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
 const sha256 = async (s) => hex(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s)));
+// PBKDF2 100 000 tours (plafond de Cloudflare Workers) : « pbkdf2:sel:hash ». L'ancien « sel:hash » SHA-256 reste lu.
+const PBKDF2_ITER = 100000;
+async function pbkdf2(salt, pw) {
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(pw), 'PBKDF2', false, ['deriveBits']);
+  return hex(await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: new TextEncoder().encode(salt), iterations: PBKDF2_ITER }, key, 256));
+}
 async function hashPassword(pw) {
   const salt = hex(crypto.getRandomValues(new Uint8Array(16)));
-  return `${salt}:${await sha256(salt + pw)}`; // « sel:hash »
+  return `pbkdf2:${salt}:${await pbkdf2(salt, pw)}`;
 }
 function same(a, b) { // comparaison en temps constant
   if (a.length !== b.length) return false;
@@ -53,8 +59,23 @@ function same(a, b) { // comparaison en temps constant
   return d === 0;
 }
 async function checkPassword(meta, pw) {
-  const [salt, h] = String(meta.password || '').split(':');
+  const parts = String(meta.password || '').split(':');
+  if (parts[0] === 'pbkdf2') return !!parts[2] && same(parts[2], await pbkdf2(parts[1], pw));
+  const [salt, h] = parts;
   return !!h && same(h, await sha256(salt + pw));
+}
+// Essais de mot de passe ratés (2026-10-26, revue sécurité) : 10 par connexion et 50 au total par vidéo et par quart d'heure.
+const PW_WINDOW = 15 * 60000, PW_MAX_IP = 10, PW_MAX_ALL = 50;
+async function pwFails(env, id) {
+  const o = await env.BUCKET.get(`lk/${id}.json`);
+  const f = (o && (await o.json().catch(() => null))) || {};
+  return f.since && Date.now() - f.since < PW_WINDOW ? f : { since: Date.now(), all: 0, ips: {} };
+}
+const pwBlocked = (f, req) => f.all >= PW_MAX_ALL || (f.ips[ipDe(req) || '?'] || 0) >= PW_MAX_IP;
+async function pwFail(env, id, f, req) {
+  const ip = ipDe(req) || '?';
+  f.all += 1; f.ips[ip] = (f.ips[ip] || 0) + 1;
+  await env.BUCKET.put(`lk/${id}.json`, JSON.stringify(f), { httpMetadata: { contentType: 'application/json' } });
 }
 async function hmac(env, msg) {
   const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(`xv:${env.COOKIE_SECRET || env.UPLOAD_TOKEN}`), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
@@ -76,7 +97,8 @@ async function unlocked(req, env, id, meta) {
   return !!c && same(c.slice(cookieName(id).length + 1), await sign(env, id, meta));
 }
 // Fichiers annexes (/f, /t, /s, /c, /r) : refusés sans cookie valide si la vidéo est privée.
-// Le fichier vidéo (/f) est aussi refusé tant que l'e-mail demandé n'a pas été laissé ; les miniatures restent publiques (aperçus).
+// La vidéo (/f), les sous-titres (/s) et les commentaires (/c) sont aussi refusés tant que l'e-mail demandé n'a pas été laissé ;
+// les miniatures restent publiques (aperçus).
 async function guarded(req, env, id, next, gateEmail = false) {
   const meta = await readMeta(env, id);
   if (meta?.password && !(await unlocked(req, env, id, meta))) return new Response('Lien privé', { status: 403, headers: { 'cache-control': 'no-store' } });
@@ -250,7 +272,7 @@ async function api(req, env, url) {
     return json({ ok: true });
   }
   if (action === 'video' && req.method === 'DELETE') {
-    await env.BUCKET.delete([key, `t/${id}.jpg`, `t/${id}-play.jpg`, `t/${id}.gif`, `m/${id}.json`, `c/${id}.json`, `l/${id}.json`, `s/${id}.srt`]);
+    await env.BUCKET.delete([key, `t/${id}.jpg`, `t/${id}-play.jpg`, `t/${id}.gif`, `m/${id}.json`, `c/${id}.json`, `l/${id}.json`, `s/${id}.srt`, `lk/${id}.json`]);
     const ev = await env.BUCKET.list({ prefix: `e/${id}/` });
     if (ev.objects.length) await env.BUCKET.delete(ev.objects.map((o) => o.key));
     return json({ ok: true });
@@ -322,11 +344,23 @@ async function moi(req, env, ctx, cle, url) {
   return new Response('<!doctype html><meta charset="utf-8"><title>X-Videos</title><body style="font:16px system-ui;background:#0a0a0b;color:#fff;padding:24px">Cet appareil est reconnu : tes vues ne comptent plus dans les statistiques.', { headers: { ...headers, 'content-type': 'text/html; charset=utf-8' } });
 }
 
+// Anti-rafale (cache du centre Cloudflare) : le même événement depuis la même connexion n'est compté qu'une fois par 10 s.
+async function rafale(id, type, req) {
+  if (typeof caches === 'undefined' || !caches.default) return false;
+  const k = new Request(`https://rl.invalid/${id}/${type}/${encodeURIComponent(ipDe(req) || '?')}`);
+  if (await caches.default.match(k)) return true;
+  await caches.default.put(k, new Response('1', { headers: { 'cache-control': 'max-age=10' } }));
+  return false;
+}
 async function track(req, env, ctx, id, url) {
   if (BOTS.test(req.headers.get('user-agent') || '')) return new Response(null, { status: 204 });
   const type = url.searchParams.get('t') || '';
   if (!/^(play|p25|p50|p75|p100|cta|site|rdv)$/.test(type)) return new Response(null, { status: 400 });
+  const meta = await readMeta(env, id);
+  if (!meta) return new Response(null, { status: 404 });
+  if (!(await unlocked(req, env, id, meta)) || !(await emailOk(req, env, id, meta))) return new Response(null, { status: 403 });
   if (await estMoi(req, env)) { ctx.waitUntil(retenirIp(req, env)); return new Response(null, { status: 204 }); }
+  if (await rafale(id, type, req)) return new Response(null, { status: 204 });
   ctx.waitUntil(logEvent(env, id, type, req));
   return new Response(null, { status: 204 });
 }
@@ -405,7 +439,7 @@ ${input}<button type="submit">${button}</button></form></body></html>`,
     { status, headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'x-robots-tag': 'noindex' } });
 }
 // Page demandant le mot de passe : aucune miniature, aucun titre, aucune balise d'aperçu (les robots ne voient rien).
-const lockedPage = (id, error) => gatePage({ id, title: 'Vidéo privée', h1: 'Vidéo privée', text: 'Entre le mot de passe reçu avec le lien.', error: error && 'Mot de passe incorrect.', status: error ? 401 : 200,
+const lockedPage = (id, error) => gatePage({ id, title: 'Vidéo privée', h1: 'Vidéo privée', text: 'Entre le mot de passe reçu avec le lien.', error: error && (error === true ? 'Mot de passe incorrect.' : error), status: error === true ? 401 : error ? 429 : 200,
   input: '<input type="password" name="pw" placeholder="Mot de passe" autocomplete="current-password" autofocus required>', button: 'Voir la vidéo' });
 
 // Balises d'aperçu (LinkedIn, Gmail, Slack) : titre + image toujours ; og:video seulement si la vidéo existe.
@@ -425,8 +459,10 @@ async function watch(req, env, ctx, id, url) {
   const secure = url.protocol === 'https:' ? '; Secure' : '';
   if (meta.password && !(await unlocked(req, env, id, meta))) {
     if (req.method === 'POST') {
+      const fails = await pwFails(env, id);
+      if (pwBlocked(fails, req)) return lockedPage(id, 'Trop d\'essais. Réessaie dans 15 minutes.');
       const pw = String((await req.formData().catch(() => new FormData())).get('pw') || '');
-      if (!(await checkPassword(meta, pw))) return lockedPage(id, true);
+      if (!(await checkPassword(meta, pw))) { await pwFail(env, id, fails, req); return lockedPage(id, true); }
       return new Response(null, { status: 303, headers: { location: `/v/${id}`, 'cache-control': 'no-store',
         'set-cookie': `${cookieName(id)}=${await sign(env, id, meta)}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax${secure}` } });
     }

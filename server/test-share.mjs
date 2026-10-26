@@ -84,7 +84,7 @@ ok('anti-abus : taille, vide, hors durée, origine, doublon, limite 500');
 
 // 3. lien privé
 const metaRaw = JSON.parse(env.BUCKET.m.get(`m/${PRIV}.json`));
-assert.match(metaRaw.password, /^[0-9a-f]{32}:[0-9a-f]{64}$/);
+assert.match(metaRaw.password, /^pbkdf2:[0-9a-f]{32}:[0-9a-f]{64}$/);
 assert.ok(!JSON.stringify(metaRaw).includes('sésame'), 'mot de passe jamais en clair');
 const lst = await (await api('/api/list')).json();
 assert.ok(lst.every((x) => !('password' in x)) && lst.find((x) => x.id === PRIV).private === true);
@@ -294,4 +294,47 @@ agg.at -= 25000; env.BUCKET.m.set('agg/stats.json', JSON.stringify(agg));
 sp = (await (await api('/api/list')).json()).find((x) => x.id === SP);
 assert.equal(sp.views, 1, 'recalculé après 20 s');
 ok('/api/list : totaux en cache 20 s (agg/stats.json), recalcul après, ?fresh=1 force');
+
+// 21. revue sécurité du 2026-10-26
+{
+  // sous-titres et commentaires fermés tant que l'e-mail demandé n'est pas laissé
+  const G = 'abcdefghsec1';
+  await put(G, { title: 'g', requireEmail: true });
+  await env.BUCKET.put(`s/${G}.srt`, '1\n00:00:00,000 --> 00:00:01,000\nsecret\n');
+  for (const q of [`/s/${G}.srt`, `/c/${G}`]) assert.equal((await call(q)).status, 403, q);
+  assert.equal((await post(G, { t: 1, text: 'non' })).status, 403);
+  // ancien mot de passe (sel:sha256) toujours accepté
+  const L = 'abcdefghsec2';
+  await put(L, { title: 'l' });
+  const salt = '00112233445566778899aabbccddeeff';
+  const h = [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(salt + 'ancien')))].map((b) => b.toString(16).padStart(2, '0')).join('');
+  const mm = JSON.parse(env.BUCKET.m.get(`m/${L}.json`)); mm.password = `${salt}:${h}`; env.BUCKET.m.set(`m/${L}.json`, JSON.stringify(mm));
+  const pw = (id, v, ip = '1.1.1.1') => call(`/v/${id}`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', 'cf-connecting-ip': ip }, body: new URLSearchParams({ pw: v }) });
+  assert.equal((await pw(L, 'ancien')).status, 303, 'ancien format lu');
+  // 10 essais ratés par connexion -> bloqué, même avec le bon mot de passe ; une autre connexion passe encore
+  const R = 'abcdefghsec3';
+  await put(R, { title: 'r', password: 'bon' });
+  for (let i = 0; i < 10; i++) assert.equal((await pw(R, 'faux' + i)).status, 401);
+  const bl = await pw(R, 'bon');
+  assert.equal(bl.status, 429); assert.ok((await bl.text()).includes('Trop d'));
+  assert.equal((await pw(R, 'bon', '2.2.2.2')).status, 303);
+  // 50 au total par vidéo, toutes connexions confondues
+  const T = 'abcdefghsec4';
+  await put(T, { title: 't', password: 'bon' });
+  for (let i = 0; i < 50; i++) await pw(T, 'x', `9.9.${Math.floor(i / 5)}.${i % 5}`);
+  assert.equal((await pw(T, 'bon', '8.8.8.8')).status, 429);
+  // la fenêtre de 15 min passée, on peut réessayer
+  const lk = JSON.parse(env.BUCKET.m.get(`lk/${T}.json`)); lk.since -= 16 * 60000; env.BUCKET.m.set(`lk/${T}.json`, JSON.stringify(lk));
+  assert.equal((await pw(T, 'bon', '8.8.8.8')).status, 303);
+  await api(`/api/video/${T}`, { method: 'DELETE' });
+  assert.ok(!env.BUCKET.m.has(`lk/${T}.json`), 'compteur effacé avec la vidéo');
+  // statistiques : vidéo inconnue refusée, vidéo privée ou à e-mail refusée sans cookie
+  const nbEv = (id) => [...env.BUCKET.m.keys()].filter((k) => k.startsWith(`e/${id}/`)).length;
+  assert.equal((await call(`/e/abcdefghzzzz?t=play`, { method: 'POST', headers: MOZ })).status, 404);
+  assert.equal(nbEv('abcdefghzzzz'), 0);
+  assert.equal((await call(`/e/${R}?t=play`, { method: 'POST', headers: MOZ })).status, 403);
+  assert.equal((await call(`/e/${G}?t=play`, { method: 'POST', headers: MOZ })).status, 403);
+  assert.equal(nbEv(R) + nbEv(G), 0);
+}
+ok('sécurité : /s et /c fermés sans e-mail, PBKDF2 + ancien format lu, 10 essais/connexion et 50/vidéo par 15 min, stats refusées sur vidéo inconnue ou fermée');
 console.log(`\n${n} groupes OK`);

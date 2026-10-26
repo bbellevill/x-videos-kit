@@ -64,24 +64,35 @@ async function checkPassword(meta, pw) {
   const [salt, h] = parts;
   return !!h && same(h, await sha256(salt + pw));
 }
-// Essais de mot de passe (2026-10-26, revue sécurité) : chaque essai est compté AVANT de tester le mot de passe, par écriture
-// conditionnelle R2 (etag) : deux essais simultanés ne peuvent pas lire le même compteur. 10 essais par connexion par quart d'heure ;
-// au-delà de 50 essais sur la vidéo, seules les connexions qui ont déjà raté sont bloquées (un vrai destinataire passe toujours).
-const PW_WINDOW = 15 * 60000, PW_MAX_IP = 10, PW_MAX_ALL = 50;
-async function pwAttempt(env, id, req) {
-  const ip = ipDe(req) || '?', key = `lk/${id}.json`;
+// Essais de mot de passe (2026-10-26, revue sécurité). Chaque essai est compté AVANT de tester le mot de passe.
+// - par connexion (IPv6 groupée par /64) : un compteur à elle, écriture conditionnelle R2 (etag), 10 essais par quart d'heure.
+//   Un attaquant ne peut se disputer que son propre compteur : il ne bloque que lui.
+// - par vidéo : au-delà de 50 essais, une connexion qui a déjà raté est bloquée et une nouvelle n'a droit qu'à 1 essai ;
+//   au-delà de 500, tout est refusé jusqu'à la fin du quart d'heure (plafond dur).
+const PW_WINDOW = 15 * 60000, PW_MAX_IP = 10, PW_SOFT_ALL = 50, PW_HARD_ALL = 500;
+const ipGroup = (req) => {
+  const ip = ipDe(req) || '?';
+  return ip.includes(':') ? ip.split(':').slice(0, 4).join(':') + '::/64' : ip;
+};
+async function bump(env, key, limit) { // +1 si le compteur est sous la limite ; renvoie le nouveau total, ou null si refusé
   for (let i = 0; i < 5; i++) {
     const o = await env.BUCKET.get(key);
     let f = (o && (await o.json().catch(() => null))) || null;
-    if (!f || !f.since || Date.now() - f.since >= PW_WINDOW) f = { since: Date.now(), all: 0, ips: {} };
-    const mine = f.ips[ip] || 0;
-    if (mine >= PW_MAX_IP || (f.all >= PW_MAX_ALL && mine > 0)) return false;
-    f.all += 1; f.ips[ip] = mine + 1;
-    const done = await env.BUCKET.put(key, JSON.stringify(f), { httpMetadata: { contentType: 'application/json' },
-      onlyIf: o ? { etagMatches: o.etag } : { etagDoesNotMatch: '*' } });
-    if (done) return true;
+    if (!f || !f.since || Date.now() - f.since >= PW_WINDOW) f = { since: Date.now(), n: 0 };
+    if (f.n >= limit) return null;
+    f.n += 1;
+    if (await env.BUCKET.put(key, JSON.stringify(f), { httpMetadata: { contentType: 'application/json' },
+      onlyIf: o ? { etagMatches: o.etag } : { etagDoesNotMatch: '*' } })) return f.n;
   }
-  return false; // trop d'essais simultanés : refusé
+  return undefined; // trop d'écritures simultanées
+}
+async function pwAttempt(env, id, req) {
+  const all = await bump(env, `lk/${id}.json`, PW_HARD_ALL);
+  if (all === null) return false; // plafond dur atteint
+  // all === undefined : compteur global disputé, on ne bloque pas pour autant (le compteur par connexion reste exact)
+  const limit = all !== undefined && all > PW_SOFT_ALL ? 1 : PW_MAX_IP;
+  const mine = await bump(env, `lk/${id}/${encodeURIComponent(ipGroup(req))}.json`, limit);
+  return typeof mine === 'number';
 }
 async function hmac(env, msg) {
   const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(`xv:${env.COOKIE_SECRET || env.UPLOAD_TOKEN}`), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
@@ -279,6 +290,8 @@ async function api(req, env, url) {
   }
   if (action === 'video' && req.method === 'DELETE') {
     await env.BUCKET.delete([key, `t/${id}.jpg`, `t/${id}-play.jpg`, `t/${id}.gif`, `m/${id}.json`, `c/${id}.json`, `l/${id}.json`, `s/${id}.srt`, `lk/${id}.json`]);
+    const lks = await env.BUCKET.list({ prefix: `lk/${id}/` });
+    if (lks.objects.length) await env.BUCKET.delete(lks.objects.map((o) => o.key));
     const ev = await env.BUCKET.list({ prefix: `e/${id}/` });
     if (ev.objects.length) await env.BUCKET.delete(ev.objects.map((o) => o.key));
     return json({ ok: true });

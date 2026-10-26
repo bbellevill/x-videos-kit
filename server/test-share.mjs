@@ -325,23 +325,36 @@ ok('/api/list : totaux en cache 20 s (agg/stats.json), recalcul après, ?fresh=1
   const bl = await pw(R, 'bon');
   assert.equal(bl.status, 429); assert.ok((await bl.text()).includes('Trop d'));
   assert.equal((await pw(R, 'bon', '2.2.2.2')).status, 303);
-  // au-delà de 50 essais sur la vidéo : les connexions qui ont raté sont bloquées, un nouveau destinataire passe encore
+  // au-delà de 50 essais sur la vidéo : une connexion qui a raté est bloquée, une nouvelle a encore 1 essai
   const T = 'abcdefghsec4';
   await put(T, { title: 't', password: 'bon' });
   for (let i = 0; i < 50; i++) await pw(T, 'x', `9.9.${Math.floor(i / 5)}.${i % 5}`);
   assert.equal((await pw(T, 'bon', '9.9.0.0')).status, 429, 'connexion qui a raté bloquée');
-  assert.equal((await pw(T, 'bon', '7.7.7.7')).status, 303, 'vrai destinataire jamais bloqué par les autres');
-  // 20 essais simultanés depuis la même connexion : 10 comptés au plus, aucun ne se perd
+  assert.equal((await pw(T, 'bon', '7.7.7.7')).status, 303, 'nouveau destinataire : 1 essai');
+  assert.equal((await pw(T, 'faux', '6.6.6.6')).status, 401);
+  assert.equal((await pw(T, 'bon', '6.6.6.6')).status, 429, 'nouvelle connexion : un seul essai au-delà de 50');
+  // IPv6 : toute la plage /64 partage un compteur
+  const V = 'abcdefghsec6';
+  await put(V, { title: 'v', password: 'bon' });
+  for (let i = 0; i < 10; i++) await pw(V, 'x', `2001:db8:1:2::${i.toString(16)}`);
+  assert.equal((await pw(V, 'bon', '2001:db8:1:2::ffff')).status, 429, 'même /64 bloquée');
+  // plafond dur : 500 essais sur la vidéo -> tout est refusé, même une nouvelle connexion
+  const H = 'abcdefghsec7';
+  await put(H, { title: 'h', password: 'bon' });
+  env.BUCKET.m.set(`lk/${H}.json`, JSON.stringify({ since: Date.now(), n: 500 }));
+  assert.equal((await pw(H, 'bon', '4.4.4.4')).status, 429, 'plafond dur');
+  // la fenêtre de 15 min passée, on peut réessayer
+  for (const k of [...env.BUCKET.m.keys()].filter((k) => k.startsWith(`lk/${T}`))) {
+    const f = JSON.parse(env.BUCKET.m.get(k)); f.since -= 16 * 60000; env.BUCKET.m.set(k, JSON.stringify(f));
+  }
+  assert.equal((await pw(T, 'bon', '9.9.0.0')).status, 303);
+  await api(`/api/video/${T}`, { method: 'DELETE' });
+  assert.ok(![...env.BUCKET.m.keys()].some((k) => k.startsWith(`lk/${T}`)), 'compteurs effacés avec la vidéo');
+  // 20 essais simultanés depuis la même connexion : 10 testés au plus
   const S = 'abcdefghsec5';
   await put(S, { title: 's', password: 'bon' });
   const rs = await Promise.all(Array.from({ length: 20 }, (_, i) => pw(S, 'z' + i, '5.5.5.5')));
   assert.ok(rs.filter((r) => r.status === 401).length <= 10, 'jamais plus de 10 essais testés');
-  assert.ok(JSON.parse(env.BUCKET.m.get(`lk/${S}.json`)).ips['5.5.5.5'] <= 10);
-  // la fenêtre de 15 min passée, on peut réessayer
-  const lk = JSON.parse(env.BUCKET.m.get(`lk/${T}.json`)); lk.since -= 16 * 60000; env.BUCKET.m.set(`lk/${T}.json`, JSON.stringify(lk));
-  assert.equal((await pw(T, 'bon', '9.9.0.0')).status, 303);
-  await api(`/api/video/${T}`, { method: 'DELETE' });
-  assert.ok(!env.BUCKET.m.has(`lk/${T}.json`), 'compteur effacé avec la vidéo');
   // statistiques : vidéo inconnue refusée, vidéo privée ou à e-mail refusée sans cookie
   const nbEv = (id) => [...env.BUCKET.m.keys()].filter((k) => k.startsWith(`e/${id}/`)).length;
   assert.equal((await call(`/e/abcdefghzzzz?t=play`, { method: 'POST', headers: MOZ })).status, 404);
@@ -350,5 +363,5 @@ ok('/api/list : totaux en cache 20 s (agg/stats.json), recalcul après, ?fresh=1
   assert.equal((await call(`/e/${G}?t=play`, { method: 'POST', headers: MOZ })).status, 403);
   assert.equal(nbEv(R) + nbEv(G), 0);
 }
-ok('sécurité : /s et /c fermés sans e-mail, PBKDF2 + ancien format lu, 10 essais/connexion, 50/vidéo sans bloquer un nouveau destinataire, compteur atomique, stats refusées sur vidéo inconnue ou fermée');
+ok('sécurité : /s et /c fermés sans e-mail, PBKDF2 + ancien format lu, 10 essais/connexion (/64 en IPv6), 1 essai pour une nouvelle connexion au-delà de 50, plafond dur 500, compteurs atomiques, stats refusées sur vidéo inconnue ou fermée');
 console.log(`\n${n} groupes OK`);

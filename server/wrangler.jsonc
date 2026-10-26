@@ -1,0 +1,19 @@
+{
+  // Hébergement des vidéos X-Videos : stockage R2 + page de lecture + API d'envoi (protégée par jeton)
+  // >>> À ADAPTER : tout ce qui concerne ton entreprise est ici (voir README.md)
+  "name": "x-videos",
+  "main": "src/index.js",
+  "compatibility_date": "2026-09-01",
+  "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "x-videos" }],
+  // ton sous-domaine pour les vidéos (il doit être sur un domaine géré par ton compte Cloudflare)
+  "routes": [{ "pattern": "video.example.com", "custom_domain": true }],
+  "vars": {
+    "BRAND_NAME": "MonEntreprise",                    // nom affiché en haut de la page vidéo
+    "BRAND_SITE": "https://www.example.com",          // ton site (logo, bouton « Voir notre site »)
+    "BRAND_COLOR": "#7b5bf4",                         // couleur des boutons
+    "BRAND_COLOR_HOVER": "#6a4be0",                   // même couleur, un peu plus foncée
+    "AUTHOR_NAME": "Prénom Nom",                      // qui parle dans les vidéos
+    "CALENDAR_URL": "https://cal.com/ton-compte/15min", // lien de prise de rendez-vous (Cal.com)
+    "CTA_LABEL": "Réserver 15 min"                    // texte du bouton
+  }
+}

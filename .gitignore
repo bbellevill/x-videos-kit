@@ -1,0 +1,6 @@
+build/
+.DS_Store
+server/.wrangler/
+server/.dev.vars
+server/node_modules/
+.claude/
